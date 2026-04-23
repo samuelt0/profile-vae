@@ -279,8 +279,8 @@ def time_pass(fn, *args) -> tuple[torch.Tensor, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dtype", choices=list(DTYPE_MAP), default="fp16")
-    parser.add_argument("--num-frames", type=int, default=77)
+    parser.add_argument("--dtype", choices=list(DTYPE_MAP), default="bf16")
+    parser.add_argument("--num-frames", type=int, default=81)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--warmup", type=int, default=3)

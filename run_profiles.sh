@@ -16,7 +16,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPORTS="${HERE}/reports"
+REPORTS="${REPORTS:-${HERE}/reports}"
 mkdir -p "${REPORTS}"
 
 NSYS=/home/samuel/nsight-systems-2025.6.1/bin/nsys
@@ -28,10 +28,10 @@ NCU=/usr/local/cuda/bin/ncu
 PY="${PY:-python}"
 
 # Full-size profiling settings (Wan 2.2 I2V defaults).
-FULL_ARGS="--dtype fp16 --num-frames 77 --height 720 --width 1280 --warmup 10 --repeat 3"
+FULL_ARGS="--dtype bf16 --num-frames 81 --height 720 --width 1280 --warmup 10 --repeat 3"
 
 # ncu settings: small tensor so kernel replay does not take hours.
-NCU_ARGS="--dtype fp16 --num-frames 5 --height 256 --width 448 --warmup 1 --repeat 1"
+NCU_ARGS="--dtype bf16 --num-frames 5 --height 256 --width 448 --warmup 1 --repeat 1"
 
 # Kernels to skip at launch (warmup + compile) and number to record. These
 # values focus the capture on a single measured encode or decode after warmup.
