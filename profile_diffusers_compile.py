@@ -14,6 +14,60 @@ import time
 import torch
 import torch._dynamo
 from diffusers import AutoencoderKLWan
+from diffusers.models.autoencoders.autoencoder_kl_wan import CACHE_T, WanResample
+
+
+def _wan_resample_forward_no_str_eq(self, x, feat_cache=None, feat_idx=[0]):
+    # Same logic as upstream WanResample.forward, but the "Rep" sentinel is
+    # detected via isinstance(..., str) instead of `== "Rep"`. Comparing a
+    # Tensor to a Python str returns NotImplemented, which makes torch.compile
+    # with fullgraph=True bail out (gb0208). Type-based dispatch is traceable.
+    b, c, t, h, w = x.size()
+    if self.mode == "upsample3d":
+        if feat_cache is not None:
+            idx = feat_idx[0]
+            if feat_cache[idx] is None:
+                feat_cache[idx] = "Rep"
+                feat_idx[0] += 1
+            else:
+                is_rep = isinstance(feat_cache[idx], str)
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                if cache_x.shape[2] < 2 and not is_rep:
+                    cache_x = torch.cat(
+                        [feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
+                    )
+                if cache_x.shape[2] < 2 and is_rep:
+                    cache_x = torch.cat([torch.zeros_like(cache_x).to(cache_x.device), cache_x], dim=2)
+                if is_rep:
+                    x = self.time_conv(x)
+                else:
+                    x = self.time_conv(x, feat_cache[idx])
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+
+                x = x.reshape(b, 2, c, t, h, w)
+                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+                x = x.reshape(b, c, t * 2, h, w)
+    t = x.shape[2]
+    x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    x = self.resample(x)
+    x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
+
+    if self.mode == "downsample3d":
+        if feat_cache is not None:
+            idx = feat_idx[0]
+            if feat_cache[idx] is None:
+                feat_cache[idx] = x.clone()
+                feat_idx[0] += 1
+            else:
+                cache_x = x[:, :, -1:, :, :].clone()
+                x = self.time_conv(torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+    return x
+
+
+WanResample.forward = _wan_resample_forward_no_str_eq
 
 # The VAE reuses WanResidualBlock / WanCausalConv3d.forward across blocks with
 # different channel counts (96, 192, 384, 768, ...). Each variant triggers a
@@ -192,11 +246,11 @@ def main() -> None:
         # the inner encoder/decoder submodules which do the heavy compute.
         vae.encoder = torch.compile(
             vae.encoder, backend="inductor",
-            mode=args.compile_mode, fullgraph=False,
+            mode=args.compile_mode, fullgraph=True,
         )
         vae.decoder = torch.compile(
             vae.decoder, backend="inductor",
-            mode=args.compile_mode, fullgraph=False,
+            mode=args.compile_mode, fullgraph=True,
         )
 
     # Latent spatial dims follow the VAE's 8x / 4x compression ratios.
