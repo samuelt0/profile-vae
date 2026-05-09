@@ -150,6 +150,9 @@ def main() -> None:
     parser.add_argument("--skip-encode", action="store_true")
     parser.add_argument("--skip-decode", action="store_true")
     parser.add_argument("--vae-patch-parallel-size", type=int, default=8)
+    parser.add_argument("--timings-dir", default=None,
+                        help="Write a per-rank timings.txt here. Defaults to "
+                             "$TIMINGS_DIR or the script directory.")
     args = parser.parse_args()
 
     assert (args.num_frames - 1) % 4 == 0, \
@@ -176,6 +179,74 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank}")
     dtype = DTYPE_MAP[args.dtype]
     torch.set_grad_enabled(False)
+
+    # End-to-end summary: rank 0 writes ONE txt with the slowest-rank per-iter
+    # numbers (the true wall-clock). Per-rank detail belongs in nsys-ui — every
+    # rank shows up as its own Process row in the Timeline view, with NVTX
+    # decode_iter_* ranges visible per rank — so we don't duplicate it on disk.
+    timings_dir = args.timings_dir or os.environ.get("TIMINGS_DIR") or os.path.dirname(
+        os.path.abspath(__file__)
+    )
+    summary_fp = None
+    if is_main:
+        os.makedirs(timings_dir, exist_ok=True)
+        summary_path = os.path.join(
+            timings_dir,
+            f"timings_pp{args.vae_patch_parallel_size}_world{world_size}_summary.txt",
+        )
+        summary_fp = open(summary_path, "w", buffering=1)
+        summary_fp.write(
+            f"# world_size={world_size} pp_size={args.vae_patch_parallel_size} "
+            f"dtype={args.dtype} shape=[1,3,{args.num_frames},{args.height},{args.width}] "
+            f"compile={not args.no_compile} channels_last={not args.no_channels_last}\n"
+            f"# 'slow' = max over ranks per iter (true wall-clock; barriers gate to slowest)\n"
+            f"# per-rank/per-GPU detail: open the .nsys-rep in nsys-ui (Timeline view)\n"
+        )
+    if dist.is_initialized():
+        dist.barrier()
+
+    def gather_and_summarize(phase: str, times: list[float]) -> None:
+        # Each rank's `times` has length args.repeat. Gather to rank 0; rank 0
+        # prints a small per-rank table to stdout (handy when watching the run)
+        # and writes only the slow-row end-to-end numbers to the summary file.
+        local = torch.tensor(times, device=device, dtype=torch.float64)
+        gathered = (
+            [torch.empty_like(local) for _ in range(world_size)] if is_main else None
+        )
+        dist.gather(local, gather_list=gathered, dst=0)
+        if not is_main:
+            return
+        n = len(times)
+        slowest_per_iter = [
+            max(gathered[r][i].item() for r in range(world_size)) for i in range(n)
+        ]
+        slowest_mean = sum(slowest_per_iter) / n
+        # Stdout: per-rank table for visibility while the run is happening.
+        header = "rank  " + "".join(f"iter_{i:<5}".ljust(11) for i in range(n)) + "mean"
+        print(f"\n=== per-rank {phase} times (ms, stdout only — see nsys for detail) ===")
+        print(header)
+        for r in range(world_size):
+            row = gathered[r].tolist()
+            mean = sum(row) / len(row)
+            print(
+                f"{r:<5} "
+                + "".join(f"{x:<10.2f} " for x in row)
+                + f"{mean:.2f}"
+            )
+        print(
+            f"slow  "
+            + "".join(f"{x:<10.2f} " for x in slowest_per_iter)
+            + f"{slowest_mean:.2f}  <- max across ranks per iter (true wall-clock)"
+        )
+        # Summary file: only the end-to-end slow numbers.
+        summary_fp.write(f"\n[{phase}] slowest-rank per iter (ms):\n")
+        for i, v in enumerate(slowest_per_iter):
+            summary_fp.write(f"  iter_{i}\t{v:.4f}\n")
+        summary_fp.write(f"  mean\t{slowest_mean:.4f}\n")
+        summary_fp.write(
+            f"  min\t{min(slowest_per_iter):.4f}\n"
+            f"  max\t{max(slowest_per_iter):.4f}\n"
+        )
     # Same seed on every rank: each rank synthesizes the same input tensor, so
     # the patch-parallel scatter sees consistent data across the world.
     torch.manual_seed(42)
@@ -211,7 +282,13 @@ def main() -> None:
         )
 
     vae.set_parallel_size(args.vae_patch_parallel_size)
-    vae.enable_tiling()
+    # Tiling is only useful when there are ≥2 ranks to distribute tiles to.
+    # At pp=1, enable_tiling() + tiled_encode/tiled_decode would force the
+    # 4×7=28-tile spatial loop in diffusers' parent class to run sequentially
+    # on the one GPU we have, which is strictly slower than the non-tiled
+    # per-chunk forward (~2.3× at 1280×720, fp32, on B200).
+    if args.vae_patch_parallel_size > 1:
+        vae.enable_tiling()
 
     latent_t = 1 + (args.num_frames - 1) // 4
     latent_h = args.height // 8
@@ -236,10 +313,16 @@ def main() -> None:
         return t
 
     def encode_one(x: torch.Tensor):
-        return vae.tiled_encode(x)
+        if args.vae_patch_parallel_size > 1:
+            return vae.tiled_encode(x)
+        # pp=1: non-tiled per-chunk forward via diffusers' _encode (use_tiling
+        # is False so the use_tiling-gated branch in _encode is skipped).
+        return vae.encode(x).latent_dist.parameters
 
     def decode_one(z: torch.Tensor):
-        return vae.tiled_decode(z)
+        if args.vae_patch_parallel_size > 1:
+            return vae.tiled_decode(z)
+        return vae.decode(z).sample
 
     # --- Encode --------------------------------------------------------------
     if not args.skip_encode:
@@ -261,17 +344,15 @@ def main() -> None:
             _, ms = time_pass(encode_one, x)
             nvtx_pop()
             encode_times.append(ms)
-            if is_main:
-                print(f"[encode iter {i}] {ms:.2f} ms")
         nvtx_pop()
         cuda_profiler_stop()
 
+        gather_and_summarize("encode", encode_times)
         if is_main:
-            mean = sum(encode_times) / len(encode_times)
-            print(f"[encode] mean={mean:.2f} ms min={min(encode_times):.2f} "
-                  f"max={max(encode_times):.2f}")
-            print(f"[encode] peak_alloc={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB "
-                  f"peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f} GiB")
+            print(
+                f"[encode] peak_alloc={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB "
+                f"peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f} GiB"
+            )
         del x
 
     # --- Decode --------------------------------------------------------------
@@ -294,18 +375,20 @@ def main() -> None:
             _, ms = time_pass(decode_one, z)
             nvtx_pop()
             decode_times.append(ms)
-            if is_main:
-                print(f"[decode iter {i}] {ms:.2f} ms")
         nvtx_pop()
         cuda_profiler_stop()
 
+        gather_and_summarize("decode", decode_times)
         if is_main:
-            mean = sum(decode_times) / len(decode_times)
-            print(f"[decode] mean={mean:.2f} ms min={min(decode_times):.2f} "
-                  f"max={max(decode_times):.2f}")
-            print(f"[decode] peak_alloc={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB "
-                  f"peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f} GiB")
+            print(
+                f"[decode] peak_alloc={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB "
+                f"peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f} GiB"
+            )
 
+    if is_main and summary_fp is not None:
+        summary_fp.close()
+        print(f"[timings] end-to-end summary: {summary_path}")
+        print(f"[timings] per-rank/per-GPU detail: open the .nsys-rep in nsys-ui")
     dist.barrier()
     dist.destroy_process_group()
 
